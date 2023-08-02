@@ -162,6 +162,8 @@ mod recv;
 #[cfg_attr(docsrs, doc(cfg(feature = "upgrade")))]
 pub mod upgrade;
 
+use miniz_oxide::{DataFormat, MZFlush};
+use miniz_oxide::inflate::stream::{InflateState, inflate};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
@@ -474,7 +476,11 @@ impl<'f, S> WebSocket<S> {
     let rsv2 = head[0] & 0b00100000 != 0;
     let rsv3 = head[0] & 0b00010000 != 0;
 
-    if rsv1 || rsv2 || rsv3 {
+    let mut compressed = false;
+
+    if rsv1 && !rsv2 && !rsv3 {
+      compressed = true;
+    } else if rsv1 || rsv2 || rsv3 {
       return Err(WebSocketError::ReservedBitsNotZero);
     }
 
@@ -526,29 +532,32 @@ impl<'f, S> WebSocket<S> {
     }
 
     let required = 2 + extra + mask.map(|_| 4).unwrap_or(0) + length;
-    if required > nread {
+    let mut payload = if required > nread {
       // Allocate more space
       let mut new_head = head.to_vec();
       new_head.resize(required, 0);
 
       stream.read_exact(&mut new_head[nread..]).await?;
-      return Ok(Frame::new(
-        fin,
-        opcode,
-        mask,
-        Payload::Owned(new_head[required - length..].to_vec()),
-      ));
-    } else if nread > required {
-      // We read too much
-      self.spill = Some(head[required..nread].to_vec());
+
+      Payload::Owned(new_head[required - length..].to_vec())
+    } else {
+      if nread > required {
+        // We read too much
+        self.spill = Some(head[required..nread].to_vec());
+      }
+
+      let buff = &mut head[required - length..required];
+      if buff.len() > self.writev_threshold {
+        Payload::BorrowedMut(buff)
+      } else {
+        Payload::Owned(buff.to_vec())
+      }
+    };
+
+    if compressed {
+      payload = Payload::Owned(inflate_payload(&payload.to_vec())?);
     }
 
-    let payload = &mut head[required - length..required];
-    let payload = if payload.len() > self.writev_threshold {
-      Payload::BorrowedMut(payload)
-    } else {
-      Payload::Owned(payload.to_vec())
-    };
     let frame = Frame::new(fin, opcode, mask, payload);
     Ok(frame)
   }
@@ -582,4 +591,26 @@ mod tests {
     }
     assert_unsync::<WebSocket<tokio::net::TcpStream>>();
   };
+}
+
+fn inflate_payload(
+  payload: &Vec<u8>
+) -> Result<Vec<u8>, WebSocketError>
+{
+  let max_output_size = usize::max_value();
+  let mut out: Vec<u8> = vec![0; payload.len().saturating_mul(2).min(max_output_size)];
+  let mut state = InflateState::new_boxed(DataFormat::Raw);
+
+  let payload = [payload.as_slice(), [0x00, 0x00, 0xff, 0xff].as_slice()].concat();
+  let res = inflate(&mut state, &payload, &mut out, MZFlush::Partial);
+
+  match res.status {
+    Ok(_) => {
+      out.truncate(res.bytes_written);
+      Ok(out)
+    }
+    Err(_) => {
+      Err(WebSocketError::InvalidEncoding)
+    }
+  }
 }
