@@ -21,9 +21,11 @@
 use base64;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use hyper::Body;
+use http_body_util::Empty;
+use hyper::body::Bytes;
 use hyper::Request;
 use hyper::Response;
+use hyper_util::rt::TokioIo;
 use pin_project::pin_project;
 use sha1::Digest;
 use sha1::Sha1;
@@ -44,6 +46,29 @@ fn sec_websocket_protocol(key: &[u8]) -> String {
 }
 
 type Error = WebSocketError;
+
+pub struct IncomingUpgrade {
+  key: String,
+  on_upgrade: hyper::upgrade::OnUpgrade,
+}
+
+impl IncomingUpgrade {
+  pub fn upgrade(self) -> Result<(Response<Empty<Bytes>>, UpgradeFut), Error> {
+    let response = Response::builder()
+      .status(hyper::StatusCode::SWITCHING_PROTOCOLS)
+      .header(hyper::header::CONNECTION, "upgrade")
+      .header(hyper::header::UPGRADE, "websocket")
+      .header("Sec-WebSocket-Accept", self.key)
+      .body(Empty::new())
+      .expect("bug: failed to build response");
+
+    let stream = UpgradeFut {
+      inner: self.on_upgrade,
+    };
+
+    Ok((response, stream))
+  }
+}
 
 /// A future that resolves to a websocket stream when the associated HTTP upgrade completes.
 #[pin_project]
@@ -69,7 +94,7 @@ pub struct UpgradeFut {
 ///
 pub fn upgrade<B>(
   mut request: impl std::borrow::BorrowMut<Request<B>>,
-) -> Result<(Response<Body>, UpgradeFut), Error> {
+) -> Result<(Response<Empty<Bytes>>, UpgradeFut), Error> {
   let request = request.borrow_mut();
 
   let key = request
@@ -93,7 +118,7 @@ pub fn upgrade<B>(
       "Sec-WebSocket-Accept",
       &sec_websocket_protocol(key.as_bytes()),
     )
-    .body(Body::from("switching to websocket protocol"))
+    .body(Empty::new())
     .expect("bug: failed to build response");
 
   let stream = UpgradeFut {
@@ -158,7 +183,7 @@ fn trim_end(data: &[u8]) -> &[u8] {
 }
 
 impl std::future::Future for UpgradeFut {
-  type Output = Result<WebSocket<hyper::upgrade::Upgraded>, Error>;
+  type Output = Result<WebSocket<TokioIo<hyper::upgrade::Upgraded>>, Error>;
 
   fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
     let this = self.project();
@@ -166,7 +191,9 @@ impl std::future::Future for UpgradeFut {
       Poll::Pending => return Poll::Pending,
       Poll::Ready(x) => x,
     };
-
-    Poll::Ready(Ok(WebSocket::after_handshake(upgraded?, Role::Server)))
+    Poll::Ready(Ok(WebSocket::after_handshake(
+      TokioIo::new(upgraded?),
+      Role::Server,
+    )))
   }
 }

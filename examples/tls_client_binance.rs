@@ -5,24 +5,19 @@ use fastwebsockets::WebSocketError;
 use fastwebsockets::{self};
 use hyper::Request;
 use hyper::Uri;
-use http_body_util::Empty;
-use hyper::body::Bytes;
 use monoio::net::TcpStream;
 use std::future::Future;
 use std::sync::Arc;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::OwnedTrustAnchor;
-use tokio_rustls::rustls::Certificate;
 use tokio_rustls::TlsConnector;
 use monoio::io::IntoPollIo;
+use bytes::Bytes;
+use http_body_util::Empty;
 
 #[allow(deprecated)]
 fn tls_connector() -> Result<TlsConnector> {
-  static CERT: &[u8] = include_bytes!("./localhost.crt");
   let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
-  let local_certs: Vec<Certificate> = rustls_pemfile::certs(&mut &*CERT)
-    .map(|mut certs| certs.drain(..).map(Certificate).collect())
-    .unwrap();
 
   root_store.add_server_trust_anchors(
     webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
@@ -33,10 +28,7 @@ fn tls_connector() -> Result<TlsConnector> {
       )
     }),
   );
-  for cert in local_certs {
-      root_store.add(&cert)?;
-  }
-  
+
   let config = ClientConfig::builder()
     .with_safe_defaults()
     .with_root_certificates(root_store)
@@ -68,7 +60,7 @@ async fn handle_websocket_upgrade(
 
   let req = Request::builder()
     .method("GET")
-    .uri(&addr)
+    .uri(format!("wss://{}/ws/btcusdt@bookTicker", &addr))
     .header("Host", &addr)
     .header("Upgrade", "websocket")
     .header("Connection", "Upgrade")
@@ -111,8 +103,9 @@ async fn handle_websocket_upgrade(
 
 #[monoio::main]
 async fn main() {
-  let uri: Uri = "127.0.0.1".parse::<hyper::Uri>().unwrap();
-  let port = 8080;
+  // !!!!! do not use proxychains or other proxy tools, the tcp steam connect may be failed !!!!
+  let uri: Uri = "data-stream.binance.com".parse::<hyper::Uri>().unwrap();
+  let port = 9443;
   handle_websocket_upgrade(uri, port).await.unwrap();
 }
 
@@ -169,5 +162,6 @@ impl tokio::io::AsyncWrite for HyperConnection {
     Pin::new(&mut self.0).poll_shutdown(cx)
   }
 }
+
 
 unsafe impl Send for HyperConnection {}
